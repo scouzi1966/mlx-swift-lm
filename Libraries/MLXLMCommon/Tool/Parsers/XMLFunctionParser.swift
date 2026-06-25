@@ -11,10 +11,12 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
     public init() {}
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
-        // Pattern: <function=(.*?)</function>
+        // Pattern: <function=name>...</function>. Keep the function name strict:
+        // malformed XML should remain text instead of becoming a bogus tool call.
         guard
             let funcMatch = content.range(
-                of: #"<function=(.*?)</function>"#, options: .regularExpression)
+                of: #"<function=[A-Za-z_][A-Za-z0-9_]*>[\s\S]*?</function>"#,
+                options: .regularExpression)
         else { return nil }
 
         let funcContent = String(content[funcMatch])
@@ -26,6 +28,7 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
         else { return nil }
 
         let funcName = String(funcContent[nameStart.upperBound ..< nameEnd.lowerBound])
+        guard isValidIdentifier(funcName) else { return nil }
         let paramSection = String(funcContent[nameEnd.upperBound...])
 
         var arguments: [String: any Sendable] = [:]
@@ -40,6 +43,7 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             else { break }
 
             let paramName = String(paramSection[paramStart.upperBound ..< nameEnd.lowerBound])
+            guard isValidIdentifier(paramName) else { return nil }
 
             // Find the closing </parameter> tag
             guard
@@ -65,5 +69,9 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
         }
 
         return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    private func isValidIdentifier(_ value: String) -> Bool {
+        value.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil
     }
 }
