@@ -71,14 +71,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = Qwen3VLMessageGenerator().generate(from: input)
-        // Check for chat template override in additionalContext
-        let chatTemplateArg: ChatTemplateArgument?
-        if let override = input.additionalContext?["chatTemplateOverride"] as? String {
-            chatTemplateArg = .literal(override)
-        } else {
-            chatTemplateArg = nil
-        }
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages, chatTemplate: chatTemplateArg, addGenerationPrompt: true, truncation: false, maxLength: nil, tools: input.tools, additionalContext: input.additionalContext)
+        var promptTokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools)
 
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
@@ -107,11 +100,11 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         var processedVideo: LMInput.ProcessedVideo?
         if !input.videos.isEmpty {
             var accumulatedFrames: [[MLXArray]] = []
-            var resizedSize: CGSize = .zero
 
             for video in input.videos {
+                var resizedSize: CGSize = .zero
                 let sequence = try await MediaProcessing.asProcessedSequence(
-                    video.asAVAsset(), samplesPerSecond: 2
+                    video, targetFPS: { _ in Double(2) }
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     if resizedSize == .zero {
@@ -919,47 +912,26 @@ enum Qwen3VLLanguage {
         }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
-            // Optimized implementation using batch operations instead of 64 individual array creations
-            // freqs shape: (3, bs, seq_len, head_dim // 2) where dim 0 is [temporal, height, width]
-            let dims = freqs.dim(-1)  // typically 64
-            let hEnd = min(mropeSection[1] * 3, dims)  // height section boundary
-            let wEnd = min(mropeSection[2] * 3, dims)  // width section boundary
+            let freqs_t = freqs[0, 0..., 0..., 0...]  // (bs, seq_len, head_dim // 2)
 
-            // Calculate number of complete triplets we can process
-            // Each triplet is [temporal, height, width] at positions [3k, 3k+1, 3k+2]
-            let numTriplets = min(hEnd, wEnd) / 3
+            let dims = freqs_t.dim(-1)
+            var slices: [MLXArray] = []
 
-            if numTriplets == 0 {
-                // Edge case: no interleaving needed, just return temporal
-                return freqs[0, 0..., 0..., 0...]
+            for idx in 0 ..< dims {
+                var slice = freqs_t[0..., 0..., idx]
+
+                for (dimIndex, offset) in [(1, 1), (2, 2)] {
+                    let end = min(mropeSection[dimIndex] * 3, dims)
+                    if idx >= offset && idx < end && (idx - offset) % 3 == 0 {
+                        slice = freqs[dimIndex, 0..., 0..., idx]
+                        break
+                    }
+                }
+
+                slices.append(slice)
             }
 
-            // Pre-compute stride indices for batch gathering
-            // Temporal: [0, 3, 6, 9, ...], Height: [1, 4, 7, 10, ...], Width: [2, 5, 8, 11, ...]
-            let tIdx = MLXArray(stride(from: 0, to: numTriplets * 3, by: 3).map { Int32($0) })
-            let hIdx = MLXArray(stride(from: 1, to: numTriplets * 3, by: 3).map { Int32($0) })
-            let wIdx = MLXArray(stride(from: 2, to: numTriplets * 3, by: 3).map { Int32($0) })
-
-            // Batch gather from each source dimension (3 operations instead of 64)
-            let tSlices = take(freqs[0, 0..., 0..., 0...], tIdx, axis: -1)
-            let hSlices = take(freqs[1, 0..., 0..., 0...], hIdx, axis: -1)
-            let wSlices = take(freqs[2, 0..., 0..., 0...], wIdx, axis: -1)
-
-            // Interleave by stacking [t, h, w] and reshaping
-            // stacked shape: (bs, seq_len, numTriplets, 3)
-            let interleaved = stacked([tSlices, hSlices, wSlices], axis: -1)
-            let bs = freqs.dim(1)
-            let seqLen = freqs.dim(2)
-            var result = interleaved.reshaped(bs, seqLen, numTriplets * 3)
-
-            // Handle remaining positions after complete triplets (use temporal frequencies)
-            let remaining = dims - numTriplets * 3
-            if remaining > 0 {
-                let remainingSlice = freqs[0, 0..., 0..., (numTriplets * 3)...]
-                result = concatenated([result, remainingSlice], axis: -1)
-            }
-
-            return result
+            return stacked(slices, axis: -1)
         }
 
         func callAsFunction(positionIds: MLXArray, dtype: MLX.DType) -> (MLXArray, MLXArray) {

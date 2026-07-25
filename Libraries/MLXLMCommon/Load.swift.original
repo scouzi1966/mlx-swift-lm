@@ -27,7 +27,7 @@ public func downloadModel(
         case .id(let id, let revision):
             // download the model weights
             let repo = Hub.Repo(id: id)
-            let modelFiles = ["*.safetensors", "*.json", "*.jinja", "tiktoken.model"]
+            let modelFiles = ["*.safetensors", "*.json"]
             return try await hub.snapshot(
                 from: repo,
                 revision: revision,
@@ -70,19 +70,10 @@ public func loadWeights(
     var weights = [String: MLXArray]()
     let enumerator = FileManager.default.enumerator(
         at: modelDirectory, includingPropertiesForKeys: nil)!
-
-    // Check if the model has vision parameters — if not, skip vision_tower weights
-    // to avoid loading ~10 GB of unused vision weights for VLM safetensors used as LLM.
-    let modelKeys = Set(model.parameters().flattened().map { $0.0 })
-    let hasVisionParams = modelKeys.contains(where: { $0.hasPrefix("vision_tower") })
-
     for case let url as URL in enumerator {
         if url.pathExtension == "safetensors" {
             let w = try loadArrays(url: url)
             for (key, value) in w {
-                if !hasVisionParams && key.hasPrefix("vision_tower") {
-                    continue
-                }
                 weights[key] = value
             }
         }
@@ -93,7 +84,7 @@ public func loadWeights(
 
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model, filter: { path, module in
+        quantize(model: model) { path, module in
             if weights["\(path).scales"] != nil {
                 if let perLayerQuantization {
                     return perLayerQuantization.quantization(layer: path)?.asTuple
@@ -103,28 +94,12 @@ public func loadWeights(
             } else {
                 return nil
             }
-        }, apply: { module, groupSize, bits, mode in
-            // Workaround for mlx-swift bug: QuantizedLinear.init calls
-            // MLX.quantized() without passing mode, producing non-nil biases
-            // even for MXFP4 (which requires biases=nil). Use the direct init
-            // with explicit biases:nil for MXFP4 quantization.
-            if mode == .mxfp4, let linear = module as? Linear {
-                let (qw, scales, _) = MLX.quantized(
-                    linear.weight, groupSize: groupSize, bits: bits, mode: mode)
-                return QuantizedLinear(
-                    weight: qw, bias: linear.bias, scales: scales, biases: nil,
-                    groupSize: groupSize, bits: bits, mode: mode)
-            }
-            return quantizeSingle(layer: module, groupSize: groupSize, bits: bits, mode: mode)
-        })
+        }
     }
 
     // apply the loaded weights
     let parameters = ModuleParameters.unflattened(weights)
-    // Use .noUnusedKeys only (skip .shapeMismatch) to match Python's strict=False.
-    // Custom modules like GLM5's MultiLinear have manually quantized weights with
-    // packed shapes that differ from the model's logical init shapes.
-    try model.update(parameters: parameters, verify: [.noUnusedKeys])
+    try model.update(parameters: parameters, verify: [.all])
 
     eval(model)
 }

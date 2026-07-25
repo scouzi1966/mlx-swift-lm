@@ -26,10 +26,10 @@ let package = Package(
             targets: ["MLXEmbedders"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.30.3"),
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.3")),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
-            from: "1.3.0"
+            .upToNextMinor(from: "1.1.6")
         ),
     ],
     targets: [
@@ -41,14 +41,10 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "MLXFast", package: "mlx-swift"),
             ],
             path: "Libraries/MLXLLM",
             exclude: [
-                "README.md",
-                "LLMModelFactory.swift.original",
-                "Models/SSM.swift.original",
-                "Models/DeepseekV3.swift.original"
+                "README.md"
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
@@ -62,13 +58,10 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "MLXFast", package: "mlx-swift"),
             ],
             path: "Libraries/MLXVLM",
             exclude: [
-                "README.md",
-                "VLMModelFactory.swift.original",
-                "Models/Qwen3VL.swift.original"
+                "README.md"
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
@@ -81,18 +74,10 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "MLXFast", package: "mlx-swift"),
             ],
             path: "Libraries/MLXLMCommon",
             exclude: [
-                "README.md",
-                "Tokenizer.swift.original",
-                "Load.swift.original",
-                "KVCache.swift.original",
-                "Chat.swift.original",
-                "SwitchLayers.swift.original",
-                "Tool/ToolCallFormat.swift.original",
-                "Evaluate.swift.original"
+                "README.md"
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
@@ -118,7 +103,6 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "MLXFast", package: "mlx-swift"),
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
@@ -139,7 +123,6 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "MLXFast", package: "mlx-swift"),
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",

@@ -10,162 +10,153 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// MARK: - Gated Delta Helpers
+// MARK: - Configuration
 
-private func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
-    x * sigmoid(gate)
-}
+public struct Qwen3NextConfiguration: Codable, Sendable {
+    var modelType: String = "qwen3_next"
+    var hiddenSize: Int
+    var hiddenLayers: Int
+    var intermediateSize: Int
+    var attentionHeads: Int
+    var kvHeads: Int
+    var headDim: Int
 
-private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(aLog.dtype)
-}
+    // Linear attention parameters
+    var linearNumValueHeads: Int
+    var linearNumKeyHeads: Int
+    var linearKeyHeadDim: Int
+    var linearValueHeadDim: Int
+    var linearConvKernelDim: Int
 
-private func gatedDeltaStepOps(
-    q: MLXArray,
-    k: MLXArray,
-    v: MLXArray,
-    g: MLXArray,
-    beta: MLXArray,
-    state: MLXArray,
-    mask: MLXArray? = nil
-) -> (MLXArray, MLXArray) {
-    let oldState = state
-    let decay: MLXArray
-    if g.ndim == 2 {
-        decay = expandedDimensions(g, axes: [2, 3])
-    } else if g.ndim == 3 {
-        decay = expandedDimensions(g, axis: -2)
-    } else {
-        fatalError("Unsupported gating shape \(g.shape)")
+    // MoE parameters
+    var numExperts: Int
+    var numExpertsPerToken: Int
+    var decoderSparseStep: Int
+    var sharedExpertIntermediateSize: Int
+    var mlpOnlyLayers: [Int]
+    var moeIntermediateSize: Int
+
+    // Normalization and embedding
+    var rmsNormEps: Float
+    var vocabularySize: Int
+    var ropeTheta: Float = 1_000_000
+    var partialRotaryFactor: Float = 1.0
+    var maxPositionEmbeddings: Int = 32768
+    var fullAttentionInterval: Int = 4
+
+    // Optional
+    var normTopkProb: Bool = false
+    var tieWordEmbeddings: Bool = false
+    var attentionBias: Bool = false
+    var ropeScaling: [String: StringOrNumber]? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case hiddenSize = "hidden_size"
+        case hiddenLayers = "num_hidden_layers"
+        case intermediateSize = "intermediate_size"
+        case attentionHeads = "num_attention_heads"
+        case kvHeads = "num_key_value_heads"
+        case headDim = "head_dim"
+        case linearNumValueHeads = "linear_num_value_heads"
+        case linearNumKeyHeads = "linear_num_key_heads"
+        case linearKeyHeadDim = "linear_key_head_dim"
+        case linearValueHeadDim = "linear_value_head_dim"
+        case linearConvKernelDim = "linear_conv_kernel_dim"
+        case numExperts = "num_experts"
+        case numExpertsPerToken = "num_experts_per_tok"
+        case decoderSparseStep = "decoder_sparse_step"
+        case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
+        case mlpOnlyLayers = "mlp_only_layers"
+        case moeIntermediateSize = "moe_intermediate_size"
+        case rmsNormEps = "rms_norm_eps"
+        case vocabularySize = "vocab_size"
+        case ropeTheta = "rope_theta"
+        case partialRotaryFactor = "partial_rotary_factor"
+        case maxPositionEmbeddings = "max_position_embeddings"
+        case fullAttentionInterval = "full_attention_interval"
+        case normTopkProb = "norm_topk_prob"
+        case tieWordEmbeddings = "tie_word_embeddings"
+        case attentionBias = "attention_bias"
+        case ropeScaling = "rope_scaling"
     }
 
-    var state = state * decay
-    let kvMem = (state * expandedDimensions(k, axis: -2)).sum(axis: -1)
-    let delta = (v - kvMem) * expandedDimensions(beta, axis: -1)
-    state = state + expandedDimensions(k, axis: -2) * expandedDimensions(delta, axis: -1)
-    let y = (state * expandedDimensions(q, axis: -2)).sum(axis: -1)
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
 
-    if let mask {
-        let expandedMask: MLXArray
-        if mask.ndim == 1 {
-            expandedMask = expandedDimensions(mask, axes: [1, 2, 3])
-        } else if mask.ndim == 2 {
-            expandedMask = expandedDimensions(mask, axes: [2, 3])
-        } else if mask.ndim == 3 {
-            expandedMask = expandedDimensions(mask, axis: -1)
-        } else {
-            fatalError("Unsupported mask shape \(mask.shape)")
-        }
-        state = MLX.where(expandedMask, state, oldState)
+        self.modelType =
+            try container.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen3_next"
+        self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+        self.kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+        self.headDim = try container.decode(Int.self, forKey: .headDim)
+
+        self.linearNumValueHeads = try container.decode(Int.self, forKey: .linearNumValueHeads)
+        self.linearNumKeyHeads = try container.decode(Int.self, forKey: .linearNumKeyHeads)
+        self.linearKeyHeadDim = try container.decode(Int.self, forKey: .linearKeyHeadDim)
+        self.linearValueHeadDim = try container.decode(Int.self, forKey: .linearValueHeadDim)
+        self.linearConvKernelDim = try container.decode(Int.self, forKey: .linearConvKernelDim)
+
+        self.numExperts = try container.decode(Int.self, forKey: .numExperts)
+        self.numExpertsPerToken = try container.decode(Int.self, forKey: .numExpertsPerToken)
+        self.decoderSparseStep = try container.decode(Int.self, forKey: .decoderSparseStep)
+        self.sharedExpertIntermediateSize = try container.decode(
+            Int.self, forKey: .sharedExpertIntermediateSize)
+        self.mlpOnlyLayers = try container.decode([Int].self, forKey: .mlpOnlyLayers)
+        self.moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
+
+        self.rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        self.vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+        self.ropeTheta =
+            try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1_000_000
+        self.partialRotaryFactor =
+            try container.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 1.0
+        self.maxPositionEmbeddings =
+            try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
+        self.fullAttentionInterval =
+            try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
+        self.normTopkProb =
+            try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? false
+        self.tieWordEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        self.attentionBias =
+            try container.decodeIfPresent(Bool.self, forKey: .attentionBias) ?? false
+        self.ropeScaling = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeScaling)
     }
-
-    return (y, state)
 }
 
-private func gatedDeltaOps(
-    q: MLXArray,
-    k: MLXArray,
-    v: MLXArray,
-    g: MLXArray,
-    beta: MLXArray,
-    state: MLXArray? = nil,
-    mask: MLXArray? = nil
-) -> (MLXArray, MLXArray) {
-    let B = q.dim(0)
-    let T = q.dim(1)
-    let Hk = q.dim(2)
-    let Dk = q.dim(3)
-    let Hv = v.dim(2)
-    let Dv = v.dim(3)
+// MARK: - RMSNormGated
 
-    var q = q
-    var k = k
-
-    let repeatFactor = Hv / Hk
-    if repeatFactor > 1 {
-        q = repeated(q, count: repeatFactor, axis: -2)
-        k = repeated(k, count: repeatFactor, axis: -2)
-    }
-
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
-
-    var ys = [MLXArray]()
-    ys.reserveCapacity(T)
-
-    for t in 0 ..< T {
-        let qT = q[0..., t]
-        let kT = k[0..., t]
-        let vT = v[0..., t]
-        let gT = g[0..., t]
-        let betaT = beta[0..., t]
-        let maskT = mask == nil ? nil : mask![0..., t]
-
-        let (y, newState) = gatedDeltaStepOps(
-            q: qT,
-            k: kT,
-            v: vT,
-            g: gT,
-            beta: betaT,
-            state: state,
-            mask: maskT
-        )
-        ys.append(y)
-        state = newState
-    }
-
-    let y = MLX.stacked(ys, axis: 1)
-    return (y, state)
-}
-
-private func gatedDeltaUpdate(
-    q: MLXArray,
-    k: MLXArray,
-    v: MLXArray,
-    a: MLXArray,
-    b: MLXArray,
-    aLog: MLXArray,
-    dtBias: MLXArray,
-    state: MLXArray? = nil,
-    mask: MLXArray? = nil
-) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b)
-    let g = computeGatedDeltaG(aLog, a, dtBias)
-
-    let B = q.dim(0)
-    let Dk = q.dim(3)
-    let Hv = v.dim(2)
-    let Dv = v.dim(3)
-
-    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
-
-    return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
-}
-
-// MARK: - Model Components
-
-final class Qwen3NextRMSNormGated: Module {
+class Qwen3NextRMSNormGated: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let eps: Float
 
-    init(dimensions: Int, eps: Float) {
+    init(hiddenSize: Int, eps: Float = 1e-6) {
         self.eps = eps
-        self._weight.wrappedValue = MLXArray.ones([dimensions])
+        self._weight.wrappedValue = MLXArray.ones([hiddenSize])
         super.init()
     }
 
     func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
         var x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
         if let gate {
-            x = x * silu(gate)
+            x = silu(gate) * x
         }
         return x
     }
 }
 
-public final class Qwen3NextAttention: Module {
+// MARK: - Full Attention (every Nth layer)
+
+class Qwen3NextAttention: Module {
     let args: Qwen3NextConfiguration
     let scale: Float
+    let numHeads: Int
+    let numKVHeads: Int
+    let headDim: Int
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -175,65 +166,78 @@ public final class Qwen3NextAttention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
-    let rope: OffsetLayer
+    let rope: RoPE
 
     init(_ args: Qwen3NextConfiguration) {
         self.args = args
-
-        let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
+        self.numHeads = args.attentionHeads
+        self.numKVHeads = args.kvHeads
+        self.headDim = args.headDim
         self.scale = pow(Float(headDim), -0.5)
 
+        // Q projects to 2x (queries + gate)
         _qProj.wrappedValue = Linear(
-            args.hiddenSize, args.attentionHeads * headDim * 2, bias: args.attentionBias)
+            args.hiddenSize, numHeads * headDim * 2, bias: args.attentionBias)
         _kProj.wrappedValue = Linear(
-            args.hiddenSize, args.kvHeads * headDim, bias: args.attentionBias)
+            args.hiddenSize, numKVHeads * headDim, bias: args.attentionBias)
         _vProj.wrappedValue = Linear(
-            args.hiddenSize, args.kvHeads * headDim, bias: args.attentionBias)
+            args.hiddenSize, numKVHeads * headDim, bias: args.attentionBias)
         _oProj.wrappedValue = Linear(
-            args.attentionHeads * headDim, args.hiddenSize, bias: args.attentionBias)
+            numHeads * headDim, args.hiddenSize, bias: args.attentionBias)
 
         _qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
 
         let ropeDims = Int(Float(headDim) * args.partialRotaryFactor)
-        self.rope = initializeRope(
-            dims: max(1, ropeDims),
-            base: args.ropeTheta,
-            traditional: false,
-            scalingConfig: args.ropeScaling,
-            maxPositionEmbeddings: args.maxPositionEmbeddings
-        )
 
-        super.init()
+        let ropeScale: Float
+        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
+            let factor = ropeScaling["factor"]
+        {
+            if let v = factor.asFloat() {
+                ropeScale = 1 / v
+            } else {
+                fatalError("ropeScaling.factor must be a float")
+            }
+        } else {
+            ropeScale = 1
+        }
+
+        self.rope = RoPE(
+            dimensions: ropeDims, traditional: false, base: args.ropeTheta, scale: ropeScale)
     }
 
-    public func callAsFunction(
+    func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        let B = x.dim(0)
-        let L = x.dim(1)
+        let (B, L) = (x.dim(0), x.dim(1))
 
+        // Q projection -> split into queries and gate
         let qProjOutput = qProj(x)
-        let qSplit = qProjOutput.reshaped(B, L, args.attentionHeads, -1).split(parts: 2, axis: -1)
-        var queries = qSplit[0]
-        let gate = qSplit[1].reshaped(B, L, -1)
+        let qReshaped = qProjOutput.reshaped(B, L, numHeads, -1)
+        let qSplits = MLX.split(qReshaped, parts: 2, axis: -1)
+        var queries = qSplits[0]
+        let gate = qSplits[1].reshaped(B, L, -1)
 
         var keys = kProj(x)
         var values = vProj(x)
 
+        // Apply Q/K norms and reshape
         queries = qNorm(queries).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, numKVHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, numKVHeads, -1).transposed(0, 2, 1, 3)
 
+        // RoPE
         if let cache {
             queries = rope(queries, offset: cache.offset)
             keys = rope(keys, offset: cache.offset)
         } else {
-            queries = rope(queries, offset: 0)
-            keys = rope(keys, offset: 0)
+            queries = rope(queries)
+            keys = rope(keys)
         }
 
-        let output = attentionWithCacheUpdate(
+        // Attention with cache
+        var output = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
@@ -244,27 +248,34 @@ public final class Qwen3NextAttention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        // Apply output gating: output * sigmoid(gate)
+        output = output * sigmoid(gate)
+
+        return oProj(output)
     }
 }
 
-final class Qwen3NextMLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gateProj: Linear
-    @ModuleInfo(key: "down_proj") var downProj: Linear
-    @ModuleInfo(key: "up_proj") var upProj: Linear
+// MARK: - MLP
+
+class Qwen3NextMLP: Module, UnaryLayer {
+    @ModuleInfo(key: "gate_proj") var gate: Linear
+    @ModuleInfo(key: "down_proj") var down: Linear
+    @ModuleInfo(key: "up_proj") var up: Linear
 
     init(dimensions: Int, hiddenDimensions: Int) {
-        _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-        _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-        _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+        _gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+        _down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
+        _up.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        down(silu(gate(x)) * up(x))
     }
 }
 
-public final class Qwen3NextGatedDeltaNet: Module {
+// MARK: - Gated DeltaNet (Linear Attention)
+
+class Qwen3NextGatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -273,181 +284,194 @@ public final class Qwen3NextGatedDeltaNet: Module {
     let keyDim: Int
     let valueDim: Int
     let convKernelSize: Int
+    let layerNormEpsilon: Float
     let convDim: Int
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
     @ModuleInfo(key: "in_proj_qkvz") var inProjQKVZ: Linear
     @ModuleInfo(key: "in_proj_ba") var inProjBA: Linear
-
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
-
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
 
-    init(_ args: Qwen3NextConfiguration) {
-        self.hiddenSize = args.hiddenSize
-        self.numVHeads = args.linearNumValueHeads
-        self.numKHeads = args.linearNumKeyHeads
-        self.headKDim = args.linearKeyHeadDim
-        self.headVDim = args.linearValueHeadDim
+    init(_ config: Qwen3NextConfiguration) {
+        self.hiddenSize = config.hiddenSize
+        self.numVHeads = config.linearNumValueHeads
+        self.numKHeads = config.linearNumKeyHeads
+        self.headKDim = config.linearKeyHeadDim
+        self.headVDim = config.linearValueHeadDim
         self.keyDim = headKDim * numKHeads
         self.valueDim = headVDim * numVHeads
-        self.convKernelSize = args.linearConvKernelDim
+        self.convKernelSize = config.linearConvKernelDim
+        self.layerNormEpsilon = config.rmsNormEps
         self.convDim = keyDim * 2 + valueDim
-
-        precondition(numVHeads % numKHeads == 0, "num_v_heads must be divisible by num_k_heads")
 
         _conv1d.wrappedValue = Conv1d(
             inputChannels: convDim,
             outputChannels: convDim,
             kernelSize: convKernelSize,
-            stride: 1,
-            padding: 0,
-            dilation: 1,
             groups: convDim,
             bias: false
         )
 
+        // Projects to q, k, v, z (gate for output)
         _inProjQKVZ.wrappedValue = Linear(
             hiddenSize, keyDim * 2 + valueDim * 2, bias: false)
-        _inProjBA.wrappedValue = Linear(hiddenSize, numVHeads * 2, bias: false)
+        // Projects to beta (b) and alpha (a)
+        _inProjBA.wrappedValue = Linear(
+            hiddenSize, numVHeads * 2, bias: false)
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
-        let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
-        _aLog.wrappedValue = log(a)
+        _aLog.wrappedValue = MLX.log(MLXArray.ones([numVHeads]) * 8.0)
 
-        _norm.wrappedValue = Qwen3NextRMSNormGated(dimensions: headVDim, eps: args.rmsNormEps)
+        _norm.wrappedValue = Qwen3NextRMSNormGated(
+            hiddenSize: headVDim, eps: config.rmsNormEps)
         _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
 
         super.init()
     }
 
+    /// Reshape interleaved projections into per-head tensors.
     private func fixQueryKeyValueOrdering(
-        mixedQKVZ: MLXArray,
-        mixedBA: MLXArray
+        mixedQKVZ: MLXArray, mixedBA: MLXArray
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
-        let B = mixedQKVZ.dim(0)
-        let S = mixedQKVZ.dim(1)
         let nk = numKHeads
         let dn = headKDim
         let nv = numVHeads
         let dv = headVDim
-        let vHeadsPerK = nv / nk
 
-        let qkvz = mixedQKVZ.reshaped(B, S, nk, -1)
-        let ba = mixedBA.reshaped(B, S, nk, -1)
+        let batchShape = Array(mixedQKVZ.shape.dropLast())
+        let qkvzReshaped = mixedQKVZ.reshaped(batchShape + [nk, -1])
+        let baReshaped = mixedBA.reshaped(batchShape + [nk, -1])
 
-        let qkvzSplit = MLX.split(
-            qkvz,
-            indices: [dn, 2 * dn, 2 * dn + vHeadsPerK * dv],
-            axis: -1
-        )
-        let q = qkvzSplit[0]
-        let k = qkvzSplit[1]
-        let v = qkvzSplit[2].reshaped(B, S, -1, dv)
-        let z = qkvzSplit[3].reshaped(B, S, -1, dv)
+        // Split qkvz along last dim: q[dn], k[dn], v[nv/nk * dv], z[nv/nk * dv]
+        let vPerK = nv / nk
+        let splitIndices = [dn, 2 * dn, 2 * dn + vPerK * dv]
+        let qkvzSplits = MLX.split(qkvzReshaped, indices: splitIndices, axis: -1)
+        let q = qkvzSplits[0]
+        let k = qkvzSplits[1]
+        let vRaw = qkvzSplits[2]
+        let zRaw = qkvzSplits[3]
 
-        let baSplit = MLX.split(ba, indices: [vHeadsPerK], axis: -1)
-        let b = baSplit[0].reshaped(B, S, nv)
-        let a = baSplit[1].reshaped(B, S, nv)
+        // Split ba along last dim: b[nv/nk], a[nv/nk]
+        let baSplits = MLX.split(baReshaped, indices: [vPerK], axis: -1)
+        let bRaw = baSplits[0]
+        let aRaw = baSplits[1]
+
+        // Reshape v, z to [B, S, Hv, Dv] and b, a to [B, S, Hv]
+        let v = vRaw.reshaped(batchShape + [nv, dv])
+        let z = zRaw.reshaped(batchShape + [nv, dv])
+        let b = bRaw.reshaped(batchShape + [nv])
+        let a = aRaw.reshaped(batchShape + [nv])
 
         return (q, k, v, z, b, a)
     }
 
-    public func callAsFunction(
-        _ inputs: MLXArray,
-        mask: MLXArray? = nil,
-        cache: MambaCache? = nil
+    func callAsFunction(
+        _ inputs: MLXArray, mask: MLXArray? = nil, cache: ArraysCache? = nil
     ) -> MLXArray {
-        let B = inputs.dim(0)
-        let S = inputs.dim(1)
+        let (B, S, _) = (inputs.dim(0), inputs.dim(1), inputs.dim(2))
 
         let (q, k, v, z, b, a) = fixQueryKeyValueOrdering(
             mixedQKVZ: inProjQKVZ(inputs),
             mixedBA: inProjBA(inputs)
         )
 
-        let dtype = inputs.dtype
+        // Conv state management
         let convState: MLXArray
-        if let cacheState = cache?[0] {
-            convState = cacheState
+        if let cache, let cached = cache[0] {
+            convState = cached
         } else {
-            convState = MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: dtype)
+            convState = MLXArray.zeros(
+                [B, convKernelSize - 1, convDim], dtype: inputs.dtype)
         }
 
-        var mixedQKV = concatenated(
+        // Concatenate q, k, v for conv
+        let mixedQKV = concatenated(
             [q.reshaped(B, S, -1), k.reshaped(B, S, -1), v.reshaped(B, S, -1)],
             axis: -1
         )
 
+        var convInput: MLXArray
         if let mask {
-            mixedQKV = MLX.where(
-                expandedDimensions(mask, axis: -1), mixedQKV, MLXArray.zeros(like: mixedQKV))
+            convInput = which(mask[.ellipsis, .newAxis], mixedQKV, 0)
+        } else {
+            convInput = mixedQKV
         }
+        convInput = concatenated([convState, convInput], axis: 1)
 
-        let convInput = concatenated([convState, mixedQKV], axis: 1)
+        // Update conv cache
         if let cache {
-            cache[0] = convInput[0..., (1 - convKernelSize)..., 0...]
+            let nKeep = convKernelSize - 1
+            cache[0] = convInput[0..., (convInput.dim(1) - nKeep)...]
         }
 
+        // Apply conv + silu
         let convOut = silu(conv1d(convInput))
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
 
-        var qOut = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        var kOut = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let vOut = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        // Split conv output back into q, k, v
+        let convSplits = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        var qConv = convSplits[0].reshaped(B, S, numKHeads, headKDim)
+        var kConv = convSplits[1].reshaped(B, S, numKHeads, headKDim)
+        let vConv = convSplits[2].reshaped(B, S, numVHeads, headVDim)
 
+        // Q/K normalization (no learned weights)
         let invScale = pow(Float(headKDim), -0.5)
-        qOut =
-            (invScale * invScale)
-            * MLXFast.rmsNorm(qOut, weight: MLXArray.mlxNone, eps: 1e-6)
-        kOut = invScale * MLXFast.rmsNorm(kOut, weight: MLXArray.mlxNone, eps: 1e-6)
+        qConv = (invScale * invScale) * manualRmsNorm(qConv, eps: 1e-6)
+        kConv = invScale * manualRmsNorm(kConv, eps: 1e-6)
+
+        // Recurrent state
+        let state: MLXArray? = cache?[1]
 
         let (out, newState) = gatedDeltaUpdate(
-            q: qOut,
-            k: kOut,
-            v: vOut,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: cache?[1],
-            mask: mask
+            q: qConv, k: kConv, v: vConv,
+            a: a, b: b,
+            ALog: aLog, dtBias: dtBias,
+            state: state, mask: mask,
+            useKernel: true
         )
 
+        // Update recurrent state cache
         if let cache {
             cache[1] = newState
         }
 
-        let normalized = norm(out, gate: z)
-        return outProj(normalized.reshaped(B, S, -1))
+        // Apply gated norm and output projection
+        let normed = norm(out, gate: z)
+        return outProj(normed.reshaped(B, S, -1))
     }
 }
 
-final class Qwen3NextSparseMoeBlock: Module {
-    let normTopkProb: Bool
+/// Manual RMS norm without learned weights: x * rsqrt(mean(x^2) + eps)
+private func manualRmsNorm(_ x: MLXArray, eps: Float) -> MLXArray {
+    let variance = (x * x).mean(axis: -1, keepDims: true)
+    return x * rsqrt(variance + eps)
+}
+
+// MARK: - Sparse MoE with Shared Expert
+
+class Qwen3NextSparseMoeBlock: Module, UnaryLayer {
     let numExperts: Int
     let topK: Int
+    let normTopkProb: Bool
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
-
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
     init(_ args: Qwen3NextConfiguration) {
-        self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
-        self.topK = args.numExpertsPerTok
+        self.topK = args.numExpertsPerToken
+        self.normTopkProb = args.normTopkProb
 
-        _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
+        _gate.wrappedValue = Linear(args.hiddenSize, numExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts
+            numExperts: numExperts
         )
-
         _sharedExpert.wrappedValue = Qwen3NextMLP(
             dimensions: args.hiddenSize,
             hiddenDimensions: args.sharedExpertIntermediateSize
@@ -456,37 +480,41 @@ final class Qwen3NextSparseMoeBlock: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        var gates = gate(x)
-        gates = MLX.softmax(gates, axis: -1, precise: true)
+        // Expert routing
+        let gates = gate(x)
+        let softGates = MLX.softmax(gates, axis: -1, precise: true)
 
         let k = topK
-        let kth = gates.dim(-1) - k
-        let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
-        var scores = MLX.takeAlong(gates, inds, axis: -1)
+        let inds = MLX.argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        var scores = MLX.takeAlong(softGates, inds, axis: -1)
+
         if normTopkProb {
-            scores = scores / scores.sum(axis: -1, keepDims: true)
+            scores = scores / MLX.sum(scores, axis: -1, keepDims: true)
         }
 
         let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let moeOutput = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
 
-        var sharedY = sharedExpert(x)
-        sharedY = sigmoid(sharedExpertGate(x)) * sharedY
+        // Shared expert with gating
+        let sharedY = sharedExpert(x)
+        let gatedSharedY = sigmoid(sharedExpertGate(x)) * sharedY
 
-        return combined + sharedY
+        return moeOutput + gatedSharedY
     }
 }
 
-final class Qwen3NextDecoderLayer: Module {
+// MARK: - Decoder Layer
+
+class Qwen3NextDecoderLayer: Module {
     let isLinear: Bool
 
-    @ModuleInfo(key: "self_attn") var selfAttn: Qwen3NextAttention?
     @ModuleInfo(key: "linear_attn") var linearAttn: Qwen3NextGatedDeltaNet?
+    @ModuleInfo(key: "self_attn") var selfAttn: Qwen3NextAttention?
 
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-    @ModuleInfo(key: "mlp") var mlp: Module
+    fileprivate let mlp: UnaryLayer
 
     init(_ args: Qwen3NextConfiguration, layerIdx: Int) {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
@@ -497,99 +525,91 @@ final class Qwen3NextDecoderLayer: Module {
             _selfAttn.wrappedValue = Qwen3NextAttention(args)
         }
 
-        _inputLayerNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _inputLayerNorm.wrappedValue = RMSNorm(
+            dimensions: args.hiddenSize, eps: args.rmsNormEps)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
-        let useMoE =
-            !args.mlpOnlyLayers.contains(layerIdx)
-            && args.numExperts > 0
-            && (layerIdx + 1) % args.decoderSparseStep == 0
-
-        if useMoE {
-            _mlp.wrappedValue = Qwen3NextSparseMoeBlock(args)
+        if !args.mlpOnlyLayers.contains(layerIdx),
+            args.numExperts > 0, (layerIdx + 1) % args.decoderSparseStep == 0
+        {
+            self.mlp = Qwen3NextSparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen3NextMLP(
+            self.mlp = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
-                hiddenDimensions: args.intermediateSize
-            )
+                hiddenDimensions: args.intermediateSize)
         }
-
-        super.init()
     }
 
     func callAsFunction(
         _ x: MLXArray,
-        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        faMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?
     ) -> MLXArray {
-        let h: MLXArray
+        let r: MLXArray
         if isLinear {
-            h = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? ArraysCache)
         } else {
-            h = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+            r = selfAttn!(inputLayerNorm(x), mask: faMask, cache: cache)
         }
-
-        let r = x + h
-        let normed = postAttentionLayerNorm(r)
-        if let moe = mlp as? Qwen3NextSparseMoeBlock {
-            return r + moe(normed)
-        }
-        return r + (mlp as! Qwen3NextMLP)(normed)
+        let h = x + r
+        let out = h + mlp(postAttentionLayerNorm(h))
+        return out
     }
 }
 
+// MARK: - Inner Model
+
 public class Qwen3NextModelInner: Module {
+    let args: Qwen3NextConfiguration
+
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen3NextDecoderLayer]
     let norm: RMSNorm
 
+    /// Index of the first linear (GatedDeltaNet) layer for SSM mask creation
     let ssmIdx: Int
+    /// Index of the first full attention layer for FA mask creation
     let faIdx: Int
 
     init(_ args: Qwen3NextConfiguration) {
+        self.args = args
         precondition(args.vocabularySize > 0)
 
         _embedTokens.wrappedValue = Embedding(
-            embeddingCount: args.vocabularySize,
-            dimensions: args.hiddenSize
-        )
+            embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
-        self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
-            Qwen3NextDecoderLayer(args, layerIdx: layerIdx)
+        self.layers = (0 ..< args.hiddenLayers).map { i in
+            Qwen3NextDecoderLayer(args, layerIdx: i)
         }
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
+        // Find first linear and first attention layer indices
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
-
-        super.init()
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
-        var hiddenStates = embedTokens(inputs)
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        var h = embedTokens(inputs)
 
-        var cacheArray = cache
-        if cacheArray == nil {
-            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
-        }
+        let cache: [KVCache?] = cache ?? Array(repeating: nil, count: layers.count)
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        // Create masks from representative caches
+        let faMask = createAttentionMask(h: h, cache: cache[faIdx])
+        let ssmMask = createSSMMask(h: h, cache: cache[ssmIdx] as? MambaCache)
 
         for (i, layer) in layers.enumerated() {
-            let mask = layer.isLinear ? ssmMask : nil
-            let attnMask = layer.isLinear ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            h = layer(h, faMask: faMask, ssmMask: ssmMask, cache: cache[i])
         }
 
-        return norm(hiddenStates)
+        return norm(h)
     }
 }
+
+// MARK: - Top-Level Model
 
 public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
@@ -603,7 +623,11 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
     public init(_ args: Qwen3NextConfiguration) {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
-        self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
+        // Linear layers use ArraysCache (0 kvHeads), attention layers use KVCacheSimple
+        self.kvHeads = (0 ..< args.hiddenLayers).map { i in
+            let isLinear = (i + 1) % args.fullAttentionInterval != 0
+            return isLinear ? 0 : args.kvHeads
+        }
         self.model = Qwen3NextModelInner(args)
 
         if !args.tieWordEmbeddings {
@@ -621,40 +645,39 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        return model.layers.map { layer in
+    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+        model.layers.map { layer in
             if layer.isLinear {
-                return MambaCache()
+                // MambaCache is ArraysCache(size: 2), compatible with createSSMMask
+                return MambaCache() as any KVCache
+            } else {
+                return KVCacheSimple() as any KVCache
             }
-            return KVCacheSimple()
         }
-    }
-
-    public func makeCache() -> [KVCache] {
-        return newCache(parameters: nil)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitizedWeights = weights
 
+        // 1. Filter out mtp.* keys (multi-token prediction weights)
+        sanitizedWeights = sanitizedWeights.filter { !$0.key.hasPrefix("mtp.") }
+
+        // Handle tied embeddings
         if configuration.tieWordEmbeddings {
             sanitizedWeights["lm_head.weight"] = nil
         }
 
-        let mtpKeys = sanitizedWeights.keys.filter { $0.contains("mtp.") }
-        for key in mtpKeys {
-            sanitizedWeights[key] = nil
-        }
-
-        if sanitizedWeights["model.layers.0.mlp.experts.0.up_proj.weight"] == nil {
+        // Match Python: if experts are already stacked (quantized model), return early.
+        // Quantized models already have norm +1.0 and conv1d transpose applied during quantization.
+        guard sanitizedWeights["model.layers.0.mlp.experts.0.up_proj.weight"] != nil else {
             return sanitizedWeights
         }
 
+        // 2. Stack MoE expert weights into SwitchGLU format
         for l in 0 ..< configuration.hiddenLayers {
             let prefix = "model.layers.\(l).mlp"
             for n in ["up_proj", "down_proj", "gate_proj"] {
-                let key = "\(prefix).experts.0.\(n).weight"
-                if sanitizedWeights[key] != nil {
+                if sanitizedWeights["\(prefix).experts.0.\(n).weight"] != nil {
                     let toJoin = (0 ..< configuration.numExperts).map { e in
                         sanitizedWeights.removeValue(
                             forKey: "\(prefix).experts.\(e).\(n).weight")!
@@ -664,6 +687,8 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
+        // 3. Transpose conv1d weights and 4. Add +1.0 to norm weights
+        // Only for unquantized models - quantized models already have these applied.
         let normSuffixes = [
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
@@ -672,122 +697,20 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
             ".k_norm.weight",
         ]
 
-        for key in Array(sanitizedWeights.keys) {
-            guard let value = sanitizedWeights[key] else { continue }
-            if key.contains("conv1d.weight") && value.dim(-1) != 1 {
-                sanitizedWeights[key] = value.movedAxis(source: 2, destination: 1)
-                continue
+        for (k, v) in sanitizedWeights {
+            // Conv1d weight transpose: Python [out, in, kernel] -> Swift [out, kernel, in]
+            if k.contains("conv1d.weight"), v.shape.last != 1 {
+                sanitizedWeights[k] = v.swappedAxes(1, 2)
             }
-            if normSuffixes.contains(where: { key.hasSuffix($0) }) && value.ndim == 1 {
-                sanitizedWeights[key] = value + 1.0
+            // Norm weights stored without +1 bias in safetensors
+            if normSuffixes.contains(where: { k.hasSuffix($0) }) {
+                if v.ndim == 1 {
+                    sanitizedWeights[k] = v + 1.0
+                }
             }
         }
 
         return sanitizedWeights
-    }
-}
-
-public struct Qwen3NextConfiguration: Codable, Sendable {
-    var modelType: String = "qwen3_next"
-    var hiddenSize: Int
-    var hiddenLayers: Int
-    var intermediateSize: Int
-    var attentionHeads: Int
-    var linearNumValueHeads: Int
-    var linearNumKeyHeads: Int
-    var linearKeyHeadDim: Int
-    var linearValueHeadDim: Int
-    var linearConvKernelDim: Int
-    var numExperts: Int
-    var numExpertsPerTok: Int
-    var decoderSparseStep: Int
-    var sharedExpertIntermediateSize: Int
-    var mlpOnlyLayers: [Int]
-    var moeIntermediateSize: Int
-    var rmsNormEps: Float
-    var vocabularySize: Int
-    var kvHeads: Int
-    var ropeTheta: Float
-    var partialRotaryFactor: Float
-    var maxPositionEmbeddings: Int
-    var normTopkProb: Bool
-    var tieWordEmbeddings: Bool
-    var attentionBias: Bool
-    var headDim: Int?
-    var ropeScaling: [String: StringOrNumber]?
-    var fullAttentionInterval: Int
-
-    enum CodingKeys: String, CodingKey {
-        case modelType = "model_type"
-        case hiddenSize = "hidden_size"
-        case hiddenLayers = "num_hidden_layers"
-        case intermediateSize = "intermediate_size"
-        case attentionHeads = "num_attention_heads"
-        case linearNumValueHeads = "linear_num_value_heads"
-        case linearNumKeyHeads = "linear_num_key_heads"
-        case linearKeyHeadDim = "linear_key_head_dim"
-        case linearValueHeadDim = "linear_value_head_dim"
-        case linearConvKernelDim = "linear_conv_kernel_dim"
-        case numExperts = "num_experts"
-        case numExpertsPerTok = "num_experts_per_tok"
-        case decoderSparseStep = "decoder_sparse_step"
-        case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
-        case mlpOnlyLayers = "mlp_only_layers"
-        case moeIntermediateSize = "moe_intermediate_size"
-        case rmsNormEps = "rms_norm_eps"
-        case vocabularySize = "vocab_size"
-        case kvHeads = "num_key_value_heads"
-        case ropeTheta = "rope_theta"
-        case partialRotaryFactor = "partial_rotary_factor"
-        case maxPositionEmbeddings = "max_position_embeddings"
-        case normTopkProb = "norm_topk_prob"
-        case tieWordEmbeddings = "tie_word_embeddings"
-        case attentionBias = "attention_bias"
-        case headDim = "head_dim"
-        case ropeScaling = "rope_scaling"
-        case fullAttentionInterval = "full_attention_interval"
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container: KeyedDecodingContainer<Qwen3NextConfiguration.CodingKeys> =
-            try decoder.container(keyedBy: Qwen3NextConfiguration.CodingKeys.self)
-
-        self.modelType =
-            try container.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen3_next"
-        self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
-        self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
-        self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
-        self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
-        self.linearNumValueHeads = try container.decode(Int.self, forKey: .linearNumValueHeads)
-        self.linearNumKeyHeads = try container.decode(Int.self, forKey: .linearNumKeyHeads)
-        self.linearKeyHeadDim = try container.decode(Int.self, forKey: .linearKeyHeadDim)
-        self.linearValueHeadDim = try container.decode(Int.self, forKey: .linearValueHeadDim)
-        self.linearConvKernelDim = try container.decode(Int.self, forKey: .linearConvKernelDim)
-        self.numExperts = try container.decode(Int.self, forKey: .numExperts)
-        self.numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
-        self.decoderSparseStep = try container.decode(Int.self, forKey: .decoderSparseStep)
-        self.sharedExpertIntermediateSize = try container.decode(
-            Int.self, forKey: .sharedExpertIntermediateSize)
-        self.mlpOnlyLayers = try container.decodeIfPresent([Int].self, forKey: .mlpOnlyLayers) ?? []
-        self.moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
-        self.rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
-        self.vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
-        self.kvHeads = try container.decode(Int.self, forKey: .kvHeads)
-        self.ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1_000_000
-        self.partialRotaryFactor =
-            try container.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 1.0
-        self.maxPositionEmbeddings =
-            try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
-        self.normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? false
-        self.tieWordEmbeddings =
-            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
-        self.attentionBias =
-            try container.decodeIfPresent(Bool.self, forKey: .attentionBias) ?? false
-        self.headDim = try container.decodeIfPresent(Int.self, forKey: .headDim)
-        self.ropeScaling = try container.decodeIfPresent(
-            [String: StringOrNumber].self, forKey: .ropeScaling)
-        self.fullAttentionInterval =
-            try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
     }
 }
 

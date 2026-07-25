@@ -1,8 +1,82 @@
 import Foundation
 import MLX
+import MLXFast
 import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
+// Patched: gate+up weight fusion + fused silu_mul Metal kernel
+
+// MARK: - Fused SiLU-Multiply Metal Kernel
+
+/// Fused kernel: given concatenated [gate, up] tensor of shape [..., 2*H],
+/// computes silu(gate) * up → [..., H] in a single dispatch.
+/// Replaces 4 graph nodes (slice + slice + silu + multiply) with 1 kernel.
+private func makeFusedSiluMulKernel() -> MLXFast.MLXFastKernel? {
+    let source = """
+        uint tid = thread_position_in_grid.x;
+        if (tid >= total_elems) return;
+
+        uint h = tid % HIDDEN;
+        uint batch = tid / HIDDEN;
+        uint base = batch * (2 * HIDDEN);
+
+        float gate_val = static_cast<float>(gate_up[base + h]);
+        float up_val = static_cast<float>(gate_up[base + HIDDEN + h]);
+
+        // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+        float silu_gate = gate_val / (1.0f + exp(-gate_val));
+        out[tid] = static_cast<InT>(silu_gate * up_val);
+    """
+
+    return MLXFast.metalKernel(
+        name: "fused_silu_mul",
+        inputNames: ["gate_up", "total_elems"],
+        outputNames: ["out"],
+        source: source
+    )
+}
+
+private final class FusedSiluMulKernelManager: @unchecked Sendable {
+    static let shared = FusedSiluMulKernelManager()
+    let kernel: MLXFast.MLXFastKernel?
+    private init() {
+        kernel = makeFusedSiluMulKernel()
+    }
+}
+
+/// Apply fused silu-multiply on a concatenated gate+up tensor.
+/// Input shape: [..., 2*hiddenDims], output shape: [..., hiddenDims]
+public func fusedSiluMul(_ gateUp: MLXArray, hiddenDims: Int) -> MLXArray {
+    guard let kernel = FusedSiluMulKernelManager.shared.kernel else {
+        // Fallback to standard ops
+        let g = gateUp[.ellipsis, ..<hiddenDims]
+        let u = gateUp[.ellipsis, hiddenDims...]
+        return silu(g) * u
+    }
+
+    let shape = gateUp.shape
+    // Output shape: same as input but last dim halved
+    var outShape = shape
+    outShape[outShape.count - 1] = hiddenDims
+
+    let totalElems = outShape.reduce(1, *)
+    let threadsPerGroup = min(256, totalElems)
+    let numGroups = (totalElems + threadsPerGroup - 1) / threadsPerGroup
+
+    let outputs = kernel(
+        [gateUp, MLXArray(Int32(totalElems))],
+        template: [
+            ("InT", gateUp.dtype),
+            ("HIDDEN", hiddenDims),
+        ],
+        grid: (numGroups * threadsPerGroup, 1, 1),
+        threadGroup: (threadsPerGroup, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [gateUp.dtype]
+    )
+    return outputs[0]
+}
+
 
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
@@ -25,7 +99,7 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
-// MARK: - SwitchGLU
+// MARK: - SwitchGLU (with fused gate+up dispatch)
 
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
@@ -36,6 +110,15 @@ public class SwitchGLU: Module {
     let hiddenDims: Int
     let numExperts: Int
     let activation: (MLXArray) -> MLXArray
+
+    // Fused gate+up quantized weights (lazily created on first forward pass)
+    private var fusedWeight: MLXArray?
+    private var fusedScales: MLXArray?
+    private var fusedBiases: MLXArray?
+    private var fusedGroupSize: Int = 0
+    private var fusedBits: Int = 0
+    private var fusedMode: QuantizationMode = .affine
+    private var fusionAttempted = false
 
     public init(
         inputDims: Int,
@@ -59,7 +142,66 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// Lazily fuse gate_proj and up_proj weights for quantized models.
+    /// Concatenates along the output dimension so a single gatherQuantizedMM
+    /// replaces two separate dispatches.
+    /// Skipped when memory headroom is tight (< 15% free) to avoid OOM on huge models.
+    private func tryFuseGateUp() {
+        guard !fusionAttempted else { return }
+        fusionAttempted = true
+
+        guard let qGate = gateProj as? QuantizedSwitchLinear,
+              let qUp = upProj as? QuantizedSwitchLinear,
+              qGate.groupSize == qUp.groupSize,
+              qGate.bits == qUp.bits,
+              qGate.mode == qUp.mode
+        else { return }
+
+        // Check memory headroom: fusion duplicates gate+up weights, so skip when tight.
+        // The fused tensor is as large as gate+up combined, held alongside the originals.
+        // For huge models (GLM-5 at 390GB on 512GB), this extra memory causes OOM.
+        let snap = Memory.snapshot()
+        let maxWorkingSet = GPU.deviceInfo().maxRecommendedWorkingSetSize
+        let headroom = maxWorkingSet > 0
+            ? Double(Int(maxWorkingSet) - snap.activeMemory) / Double(maxWorkingSet)
+            : 1.0
+        if headroom < 0.20 {
+            // Not enough headroom — fall back to separate dispatches
+            return
+        }
+
+        // Concatenate along output dimension (axis 1): [E, N, K_packed] → [E, 2N, K_packed]
+        fusedWeight = concatenated([qGate.weight, qUp.weight], axis: 1)
+        fusedScales = concatenated([qGate.scales, qUp.scales], axis: 1)
+        if let gBiases = qGate.biases, let uBiases = qUp.biases {
+            fusedBiases = concatenated([gBiases, uBiases], axis: 1)
+        }
+        fusedGroupSize = qGate.groupSize
+        fusedBits = qGate.bits
+        fusedMode = qGate.mode
+
+        // Materialize fused tensors
+        if let fw = fusedWeight, let fs = fusedScales {
+            var toEval: [MLXArray] = [fw, fs]
+            if let fb = fusedBiases { toEval.append(fb) }
+            MLX.eval(toEval)
+        }
+
+        // Release original gate/up weights via Module.update(parameters:)
+        // to avoid holding both fused and original copies (~289MB/layer).
+        let tiny = MLXArray(Float16(0))
+        let releaseWeights: [String: MLXArray] = [
+            "gate_proj.weight": tiny,
+            "gate_proj.scales": tiny,
+            "up_proj.weight": tiny,
+            "up_proj.scales": tiny,
+        ]
+        self.update(parameters: ModuleParameters.unflattened(releaseWeights))
+    }
+
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        tryFuseGateUp()
+
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
         let doSort = indices.size >= 64
@@ -71,18 +213,41 @@ public class SwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        let xUp = upProj(x, idx, sortedIndices: doSort)
-        let xGate = gateProj(x, idx, sortedIndices: doSort)
-        x = downProj(
-            activation(xGate) * xUp,
-            idx,
-            sortedIndices: doSort)
+        let result: MLXArray
+        if let fWeight = fusedWeight, let fScales = fusedScales {
+            // Fused path: single gatherQuantizedMM for gate+up
+            let gateUp = MLX.gatherQuantizedMM(
+                x,
+                fWeight,
+                scales: fScales,
+                biases: fusedBiases,
+                rhsIndices: idx,
+                transpose: true,
+                groupSize: fusedGroupSize,
+                bits: fusedBits,
+                mode: fusedMode,
+                sortedIndices: doSort
+            )
 
-        if doSort {
-            x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
+            // Fused silu-multiply: replaces slice+slice+silu+mul with 1 Metal kernel
+            let activated = fusedSiluMul(gateUp, hiddenDims: hiddenDims)
+            result = downProj(activated, idx, sortedIndices: doSort)
+        } else {
+            // Fallback: separate dispatches (non-quantized models)
+            let xUp = upProj(x, idx, sortedIndices: doSort)
+            let xGate = gateProj(x, idx, sortedIndices: doSort)
+            result = downProj(
+                activation(xGate) * xUp,
+                idx,
+                sortedIndices: doSort)
         }
 
-        return MLX.squeezed(x, axis: -2)
+        var out = result
+        if doSort {
+            out = scatterUnsort(x: out, invOrder: inverseOrder, shape: indices.shape)
+        }
+
+        return MLX.squeezed(out, axis: -2)
     }
 }
 
