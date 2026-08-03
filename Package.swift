@@ -26,7 +26,7 @@ let package = Package(
             targets: ["MLXEmbedders"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.30.3"),
+        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.6"),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             from: "1.3.0"

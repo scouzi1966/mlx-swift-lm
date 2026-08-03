@@ -222,6 +222,8 @@ public class ToolCallIntegrationTests: XCTestCase {
                     collectedText += text
                 case .toolCall(let toolCall):
                     collectedToolCalls.append(toolCall)
+                case .tokenLogprobs:
+                    break
                 case .info:
                     break
                 }
