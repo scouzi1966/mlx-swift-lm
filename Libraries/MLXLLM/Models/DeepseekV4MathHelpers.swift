@@ -639,9 +639,6 @@ public enum DeepseekV4Math {
         up: MLXArray,
         limit: Float
     ) -> MLXArray {
-        let body = limit > 0
-            ? _deepseekV4SwiGLUClampedBody
-            : _deepseekV4SwiGLUUnclampedBody
         let compiled = limit > 0
             ? _compiledDeepseekV4SwiGLUClamped
             : _compiledDeepseekV4SwiGLUUnclamped
