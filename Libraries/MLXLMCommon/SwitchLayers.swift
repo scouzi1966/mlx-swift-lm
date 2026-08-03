@@ -247,7 +247,6 @@ public class SwitchGLU: Module, SwitchGLULayer {
         self.fusedGroupSize = g.groupSize
         self.fusedBits = g.bits
         self.fusedMode = g.mode
-
     }
 
     private func fusedGateUpCacheByteLimit() -> Int {
@@ -540,5 +539,4 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
 
         return result
     }
-
 }
