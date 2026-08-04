@@ -1604,16 +1604,6 @@ public class DeepseekV4ModelInner: Module {
     @ModuleInfo(key: "hc_head") var hcHead: DeepseekV4HyperHead
     @ModuleInfo(key: "norm") var norm: RMSNorm
 
-    private static let compileHeadDecode = DeepseekV4RuntimeOptions.enabled(
-        "VMLX_DSV4_COMPILE_HEAD", default: true)
-
-    private lazy var compiledHeadDecode: @Sendable ([MLXArray]) -> [MLXArray] = {
-        let body: ([MLXArray]) -> [MLXArray] = { [unowned self] args in
-            [self.norm(self.hcHead.reduce(args[0]))]
-        }
-        return compile(shapeless: false, body)
-    }()
-
     init(config: DeepseekV4Configuration) {
         self.config = config
         self._embedTokens.wrappedValue = Embedding(
@@ -1650,13 +1640,6 @@ public class DeepseekV4ModelInner: Module {
         }
 
         // HyperHead reduce: (B, L, hcMult, H) → (B, L, H)
-        if Self.compileHeadDecode,
-            h.dim(1) == 1,
-            Device.defaultDevice().deviceType == .gpu,
-            !DeepseekV4NumericTrace.enabled
-        {
-            return compiledHeadDecode([h])[0]
-        }
         var out = hcHead.reduce(h)
         DeepseekV4NumericTrace.tensor("hc_head", out)
         out = norm(out)
