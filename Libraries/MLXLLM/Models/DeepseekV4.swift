@@ -1154,8 +1154,9 @@ private enum DeepseekV4SharedExpertKernels {
                 const float gate = simd_sum(gateSum[row]);
                 const float up = simd_sum(upSum[row]);
                 if (lane == 0u) {
-                    const float limitedGate = metal::min(gate, LIMIT);
-                    const float limitedUp = metal::clamp(up, -LIMIT, LIMIT);
+                    const float limit = static_cast<float>(LIMIT);
+                    const float limitedGate = metal::min(gate, limit);
+                    const float limitedUp = metal::clamp(up, -limit, limit);
                     activated[firstRow + row] = static_cast<outT>(
                         (limitedGate / (1.0f + metal::exp(-limitedGate))) * limitedUp);
                 }
