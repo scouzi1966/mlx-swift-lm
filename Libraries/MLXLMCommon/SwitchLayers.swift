@@ -121,7 +121,7 @@ private enum SwitchGLUKernelEngine {
     }
 
     static var deepseekMXFP4SIMDGroupsPerThreadgroup: Int {
-        constrainedInteger("VMLX_DSV4_MXFP4_SIMD_GROUPS", allowed: [1, 2, 4, 8], default: 2)
+        constrainedInteger("VMLX_DSV4_MXFP4_SIMD_GROUPS", allowed: [1, 2, 4, 8], default: 4)
     }
 
     private static func constrainedInteger(
