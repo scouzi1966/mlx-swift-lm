@@ -295,7 +295,7 @@ class DeepseekV4Attention: Module {
         ).reshaped(oGroups, oLoraRank, groupFeatures)
     }
 
-    fileprivate func projectAttentionOutput(
+    private func projectAttentionOutput(
         _ attention: MLXArray,
         cos: MLXArray,
         sin: MLXArray,
@@ -318,10 +318,7 @@ class DeepseekV4Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache?,
-        decodeProjection: ((MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -554,9 +551,6 @@ class DeepseekV4Attention: Module {
         // graph. Only the stateless inverse-RoPE and grouped projection tail
         // is compiled, so mutable KV cache state remains explicit above.
         let groupedWeight = groupedOutputWeight(dtype: output.dtype)
-        if L == 1, let decodeProjection {
-            return decodeProjection(output, cosT, sinT, groupedWeight)
-        }
         if Self.compileAttentionPostDecode,
             L == 1,
             Device.defaultDevice().deviceType == .gpu,
@@ -1371,17 +1365,15 @@ class DeepseekV4DecoderLayer: Module {
     private lazy var compiledLayerTailDecode: @Sendable ([MLXArray]) -> [MLXArray] = {
         let body: ([MLXArray]) -> [MLXArray] = { [unowned self] args in
             CompiledDecodeTrace.withActive {
-                let attnOut = self.selfAttn.projectAttentionOutput(
-                    args[0], cos: args[1], sin: args[2], groupedWeight: args[3])
                 let hA = self.attnHC.expand(
-                    blockOut: attnOut,
-                    residual: args[4],
-                    post: args[5],
-                    comb: args[6])
+                    blockOut: args[0],
+                    residual: args[1],
+                    post: args[2],
+                    comb: args[3])
                 let residual = hA
                 let collapsed = self.ffnHC.collapseNormalized(
                     hA, normalization: self.postAttentionLayerNorm)
-                let output = self.mlp.forward(collapsed.normalized, inputIds: args[7])
+                let output = self.mlp.forward(collapsed.normalized, inputIds: args[4])
                 return [self.ffnHC.expand(
                     blockOut: output,
                     residual: residual,
@@ -1461,27 +1453,20 @@ class DeepseekV4DecoderLayer: Module {
             DeepseekV4NumericTrace.tensor("layer.0.attn_norm", normedA)
         }
         finishStage("attn_norm", [normedA])
-        if Self.compileFFNDecode && h.dim(1) == 1
-            && !profileStages && !DeepseekV4NumericTrace.enabled
-        {
-            let ids = inputIds
-                ?? MLXArray.zeros([h.dim(0), h.dim(1)], dtype: .uint32)
-            return selfAttn(
-                normedA,
-                mask: mask,
-                cache: cache,
-                decodeProjection: { [unowned self] output, cos, sin, groupedWeight in
-                    self.compiledLayerTailDecode([
-                        output, cos, sin, groupedWeight,
-                        residualA, postA, combA, ids,
-                    ])[0]
-                })
-        }
         let attnOut = selfAttn(normedA, mask: mask, cache: cache)
         if layerIdx == 0 {
             DeepseekV4NumericTrace.tensor("layer.0.attention", attnOut)
         }
         finishStage("attention", [attnOut])
+        if Self.compileFFNDecode && h.dim(1) == 1
+            && !profileStages && !DeepseekV4NumericTrace.enabled
+        {
+            let ids = inputIds
+                ?? MLXArray.zeros([h.dim(0), h.dim(1)], dtype: .uint32)
+            return compiledLayerTailDecode([
+                attnOut, residualA, postA, combA, ids,
+            ])[0]
+        }
         let hA = attnHC.expand(
             blockOut: attnOut, residual: residualA, post: postA, comb: combA)
         if layerIdx == 0 {
