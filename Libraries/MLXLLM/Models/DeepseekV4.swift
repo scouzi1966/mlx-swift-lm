@@ -1362,18 +1362,23 @@ class DeepseekV4DecoderLayer: Module {
     }()
     private static let compileFFNDecode = DeepseekV4RuntimeOptions.enabled(
         "VMLX_DSV4_COMPILE_FFN", default: true)
-    private lazy var compiledFFNDecode: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-        let body: (MLXArray, MLXArray) -> MLXArray = { [unowned self] hA, ids in
+    private lazy var compiledLayerTailDecode: @Sendable ([MLXArray]) -> [MLXArray] = {
+        let body: ([MLXArray]) -> [MLXArray] = { [unowned self] args in
             CompiledDecodeTrace.withActive {
+                let hA = self.attnHC.expand(
+                    blockOut: args[0],
+                    residual: args[1],
+                    post: args[2],
+                    comb: args[3])
                 let residual = hA
                 let collapsed = self.ffnHC.collapseNormalized(
                     hA, normalization: self.postAttentionLayerNorm)
-                let output = self.mlp.forward(collapsed.normalized, inputIds: ids)
-                return self.ffnHC.expand(
+                let output = self.mlp.forward(collapsed.normalized, inputIds: args[4])
+                return [self.ffnHC.expand(
                     blockOut: output,
                     residual: residual,
                     post: collapsed.post,
-                    comb: collapsed.comb)
+                    comb: collapsed.comb)]
             }
         }
         return compile(shapeless: false, body)
@@ -1453,6 +1458,15 @@ class DeepseekV4DecoderLayer: Module {
             DeepseekV4NumericTrace.tensor("layer.0.attention", attnOut)
         }
         finishStage("attention", [attnOut])
+        if Self.compileFFNDecode && h.dim(1) == 1
+            && !profileStages && !DeepseekV4NumericTrace.enabled
+        {
+            let ids = inputIds
+                ?? MLXArray.zeros([h.dim(0), h.dim(1)], dtype: .uint32)
+            return compiledLayerTailDecode([
+                attnOut, residualA, postA, combA, ids,
+            ])[0]
+        }
         let hA = attnHC.expand(
             blockOut: attnOut, residual: residualA, post: postA, comb: combA)
         if layerIdx == 0 {
@@ -1461,11 +1475,6 @@ class DeepseekV4DecoderLayer: Module {
         finishStage("attn_hc_post", [hA])
 
         // ---- FFN HC ----
-        if Self.compileFFNDecode && hA.dim(1) == 1 {
-            let ids = inputIds
-                ?? MLXArray.zeros([hA.dim(0), hA.dim(1)], dtype: .uint32)
-            return compiledFFNDecode(hA, ids)
-        }
         let residualF = hA
         let collapsedF = ffnHC.collapseNormalized(
             hA, normalization: postAttentionLayerNorm)
