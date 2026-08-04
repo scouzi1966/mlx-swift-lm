@@ -43,6 +43,16 @@ private enum DeepseekV4PerformanceProfile {
     }
 }
 
+private enum DeepseekV4RuntimeOptions {
+    static func enabled(_ name: String, default defaultValue: Bool) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[name] else {
+            return defaultValue
+        }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return value != "0" && value != "false" && value != "off"
+    }
+}
+
 private enum DeepseekV4NumericTrace {
     static let enabled =
         ProcessInfo.processInfo.environment["VMLX_DSV4_NUMERIC_TRACE"] == "1"
@@ -160,8 +170,8 @@ class DeepseekV4Attention: Module {
         return raw != "0" && raw.lowercased() != "false"
     }()
 
-    private static let compileAttentionPostDecode =
-        ProcessInfo.processInfo.environment["VMLX_DSV4_COMPILE_ATTN_POST"] == "1"
+    private static let compileAttentionPostDecode = DeepseekV4RuntimeOptions.enabled(
+        "VMLX_DSV4_COMPILE_ATTN_POST", default: true)
 
     private lazy var compiledAttentionPostDecode: @Sendable ([MLXArray]) -> [MLXArray] = {
         let body: ([MLXArray]) -> [MLXArray] = { [unowned self] args in
@@ -906,8 +916,8 @@ class DeepseekV4MoEGate: Module {
     let isHashLayer: Bool
     fileprivate let compiledSelector: DeepseekV4CompiledSelectorCache.Selector
     let scalingFactorArray: MLXArray
-    private static let fusedRouterEnabled =
-        ProcessInfo.processInfo.environment["VMLX_DSV4_FUSED_ROUTER"] == "1"
+    private static let fusedRouterEnabled = DeepseekV4RuntimeOptions.enabled(
+        "VMLX_DSV4_FUSED_ROUTER", default: true)
     /// Gate projection weight: (nRoutedExperts, hiddenSize). Stored as a
     /// raw parameter (loaded via sanitize) rather than a Linear to allow
     /// the matmul to run in fp32 per the authoritative reference.
@@ -1333,8 +1343,8 @@ class DeepseekV4DecoderLayer: Module {
     @ModuleInfo(key: "ffn_hc") var ffnHC: DeepseekV4HyperConnection
 
     let layerIdx: Int
-    private static let compileAttentionHCDecode =
-        ProcessInfo.processInfo.environment["VMLX_DSV4_COMPILE_ATTN_HC"] == "1"
+    private static let compileAttentionHCDecode = DeepseekV4RuntimeOptions.enabled(
+        "VMLX_DSV4_COMPILE_ATTN_HC", default: true)
     private lazy var compiledAttentionHCDecode: @Sendable ([MLXArray]) -> [MLXArray] = {
         let body: ([MLXArray]) -> [MLXArray] = { [unowned self] args in
             CompiledDecodeTrace.withActive {
@@ -1350,8 +1360,8 @@ class DeepseekV4DecoderLayer: Module {
         }
         return compile(shapeless: false, body)
     }()
-    private static let compileFFNDecode =
-        ProcessInfo.processInfo.environment["VMLX_DSV4_COMPILE_FFN"] == "1"
+    private static let compileFFNDecode = DeepseekV4RuntimeOptions.enabled(
+        "VMLX_DSV4_COMPILE_FFN", default: true)
     private lazy var compiledFFNDecode: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         let body: (MLXArray, MLXArray) -> MLXArray = { [unowned self] hA, ids in
             CompiledDecodeTrace.withActive {

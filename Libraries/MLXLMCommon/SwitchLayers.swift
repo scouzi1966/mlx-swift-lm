@@ -106,7 +106,10 @@ private enum SwitchGLUKernelEngine {
         let raw = (env["AFM_MLX_KERNELS"] ?? env["VMLX_DSV4_KERNELS"] ?? "native")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        return raw == "native" && env["VMLX_DSV4_NATIVE_MXFP4"] == "1"
+        let override = (env["VMLX_DSV4_NATIVE_MXFP4"] ?? "1")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return raw == "native" && override != "0" && override != "false"
     }
 
     static var specializedDeepseekMXFP4Enabled: Bool {
