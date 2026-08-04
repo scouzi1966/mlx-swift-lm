@@ -33,6 +33,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -1091,6 +1092,143 @@ class DeepseekV4MoEGate: Module {
     }
 }
 
+// MARK: - MXFP8 shared expert decode
+
+private enum DeepseekV4SharedExpertKernels {
+    private static let inputDims = 4096
+    private static let hiddenDims = 2048
+    private static let groupSize = 32
+
+    private static var enabled: Bool {
+        let raw = ProcessInfo.processInfo.environment["VMLX_DSV4_FUSED_SHARED_MXFP8"] ?? "1"
+        return raw != "0" && raw.lowercased() != "false"
+    }
+
+    private static let gateUpSwiGLUKernel = MLXFast.metalKernel(
+        name: "deepseek_v4_native_mxfp8_shared_gate_up_swiglu",
+        inputNames: ["x", "gateW", "gateS", "upW", "upS"],
+        outputNames: ["activated"],
+        source: """
+            constexpr uint ROWS_PER_SIMD = 4u;
+            constexpr uint VALUES_PER_LANE = 8u;
+            constexpr uint BLOCK = 256u;
+
+            const uint lane = thread_index_in_simdgroup;
+            const uint simd = thread_position_in_grid.x / 32u;
+            const uint firstRow = simd * ROWS_PER_SIMD;
+            if (firstRow >= HIDDEN) return;
+
+            device const uchar *gateBytes =
+                reinterpret_cast<device const uchar *>(gateW);
+            device const uchar *upBytes =
+                reinterpret_cast<device const uchar *>(upW);
+            float gateSum[ROWS_PER_SIMD] = {0.0f};
+            float upSum[ROWS_PER_SIMD] = {0.0f};
+
+            for (uint block = 0u; block < INPUT; block += BLOCK) {
+                const uint valueBase = block + lane * VALUES_PER_LANE;
+                float xv[VALUES_PER_LANE];
+                for (uint i = 0u; i < VALUES_PER_LANE; ++i) {
+                    xv[i] = static_cast<float>(x[valueBase + i]);
+                }
+
+                const uint scaleColumn = block / GROUP_SIZE + lane / 4u;
+                for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                    const uint outputRow = firstRow + row;
+                    const uint weightBase = outputRow * INPUT + valueBase;
+                    const uint scaleIndex = outputRow * GROUPS + scaleColumn;
+                    const float gateScale = dsv4_shared_e8m0(gateS[scaleIndex]);
+                    const float upScale = dsv4_shared_e8m0(upS[scaleIndex]);
+                    float gateDot = 0.0f;
+                    float upDot = 0.0f;
+                    for (uint i = 0u; i < VALUES_PER_LANE; ++i) {
+                        gateDot += xv[i] * dsv4_shared_e4m3(gateBytes[weightBase + i]);
+                        upDot += xv[i] * dsv4_shared_e4m3(upBytes[weightBase + i]);
+                    }
+                    gateSum[row] += gateDot * gateScale;
+                    upSum[row] += upDot * upScale;
+                }
+            }
+
+            for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                const float gate = simd_sum(gateSum[row]);
+                const float up = simd_sum(upSum[row]);
+                if (lane == 0u) {
+                    const float limitedGate = metal::min(gate, LIMIT);
+                    const float limitedUp = metal::clamp(up, -LIMIT, LIMIT);
+                    activated[firstRow + row] = static_cast<outT>(
+                        (limitedGate / (1.0f + metal::exp(-limitedGate))) * limitedUp);
+                }
+            }
+        """,
+        header: """
+            static inline float dsv4_shared_e4m3(uchar value) {
+                const ushort magnitudeBits = ushort(value & 0x7fu) << 7u;
+                const half magnitude = as_type<half>(magnitudeBits) * half(256.0h);
+                return (value & 0x80u) != 0u ? -float(magnitude) : float(magnitude);
+            }
+
+            static inline float dsv4_shared_e8m0(uchar exponent) {
+                const uint bits = exponent == 0u
+                    ? 0x00400000u
+                    : (uint(exponent) << 23u);
+                return as_type<float>(bits);
+            }
+        """)
+
+    static func gateUpSwiGLU(
+        _ x: MLXArray,
+        gate: DeepseekV4QuantizedLinear,
+        up: DeepseekV4QuantizedLinear,
+        limit: Float
+    ) -> MLXArray? {
+        guard enabled,
+              x.size == inputDims,
+              x.dim(-1) == inputDims,
+              gate.shape == (hiddenDims, inputDims),
+              up.shape == (hiddenDims, inputDims),
+              gate.groupSize == groupSize,
+              up.groupSize == groupSize,
+              gate.bits == 8,
+              up.bits == 8,
+              gate.mode == .mxfp8,
+              up.mode == .mxfp8,
+              gate.weight.dtype == .uint32,
+              up.weight.dtype == .uint32,
+              gate.scales.dtype == .uint8,
+              up.scales.dtype == .uint8,
+              gate.bias == nil,
+              up.bias == nil,
+              gate.biases == nil,
+              up.biases == nil
+        else { return nil }
+
+        let activation = DeepseekV4ActivationQuant.e4m3RoundTripIfNeeded(
+            contiguous(x), mode: gate.mode)
+        var outputShape = x.shape
+        outputShape[outputShape.count - 1] = hiddenDims
+        return gateUpSwiGLUKernel(
+            [
+                contiguous(activation.flattened()),
+                contiguous(gate.weight), contiguous(gate.scales),
+                contiguous(up.weight), contiguous(up.scales),
+            ],
+            template: [
+                ("outT", x.dtype),
+                ("INPUT", inputDims),
+                ("HIDDEN", hiddenDims),
+                ("GROUP_SIZE", groupSize),
+                ("GROUPS", inputDims / groupSize),
+                ("LIMIT", Int(limit)),
+            ],
+            grid: (32 * ((hiddenDims + 3) / 4), 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [outputShape],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+}
+
 // MARK: - MoE (SwitchGLU routed + shared expert)
 
 class DeepseekV4MoE: Module, UnaryLayer {
@@ -1204,6 +1342,13 @@ class DeepseekV4MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let gate = gateProj as? DeepseekV4QuantizedLinear,
+           let up = upProj as? DeepseekV4QuantizedLinear,
+           let activated = DeepseekV4SharedExpertKernels.gateUpSwiGLU(
+               x, gate: gate, up: up, limit: swigluLimit)
+        {
+            return downProj(activated)
+        }
         let g = gateProj(x)
         let u = upProj(x)
         return downProj(DeepseekV4Math.dsv4SwiGLU(gate: g, up: u, limit: swigluLimit))
