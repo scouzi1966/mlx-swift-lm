@@ -173,9 +173,6 @@ class DeepseekV4Attention: Module {
     private static let compileAttentionPostDecode = DeepseekV4RuntimeOptions.enabled(
         "VMLX_DSV4_COMPILE_ATTN_POST", default: true)
 
-    private static let compileAttentionDecode = DeepseekV4RuntimeOptions.enabled(
-        "VMLX_DSV4_COMPILE_ATTN", default: true)
-
     private static let compileAttentionPreDecode = DeepseekV4RuntimeOptions.enabled(
         "VMLX_DSV4_COMPILE_ATTN_PRE", default: true)
 
@@ -192,18 +189,6 @@ class DeepseekV4Attention: Module {
                 args[0], cos: args[1], sin: args[2], groupedWeight: args[3])]
         }
         return compile(shapeless: false, body)
-    }()
-
-    private lazy var compiledAttentionDecode: @Sendable ([MLXArray]) -> [MLXArray] = {
-        let body: ([MLXArray]) -> [MLXArray] = { [unowned self] args in
-            let output = MLXFast.scaledDotProductAttention(
-                queries: args[0], keys: args[1], values: args[1],
-                scale: self.scale, mask: .none,
-                sinks: self.config.useAttnSink ? args[5] : nil)
-            return [self.projectAttentionOutput(
-                output, cos: args[2], sin: args[3], groupedWeight: args[4])]
-        }
-        return compile(shapeless: true, body)
     }()
 
     let rope: DeepseekV4RoPE
@@ -639,17 +624,6 @@ class DeepseekV4Attention: Module {
         }
 
         // --- SDPA with attention sinks ---
-        if Self.compileAttentionDecode,
-            L == 1,
-            Device.defaultDevice().deviceType == .gpu,
-            !DeepseekV4NumericTrace.enabled,
-            case .none = adjustedMask
-        {
-            let groupedWeight = groupedOutputWeight(dtype: q.dtype)
-            return compiledAttentionDecode([
-                q, fullKV, cosT, sinT, groupedWeight, attnSink.asType(q.dtype),
-            ])[0]
-        }
         let output = MLXFast.scaledDotProductAttention(
             queries: q, keys: fullKV, values: fullKV,
             scale: scale, mask: adjustedMask,
